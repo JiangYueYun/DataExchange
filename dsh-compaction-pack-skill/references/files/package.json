@@ -1,0 +1,34 @@
+{
+  "name": "@dsh-external/dsh-compaction-pack",
+  "description": "Compaction pack for DSH: replaces the shipped compaction backend with one whose thresholds, verbatim retention, summary route, and checkpoint instruction are live-editable from a Plugins-page settings card.",
+  "version": "1.1.2",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./tuning": "./lib/tuning.js",
+    "./engine": "./lib/engine.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "lib",
+    "tools",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  }
+}

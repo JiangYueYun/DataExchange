@@ -1,0 +1,87 @@
+# 压缩替换包：架构与设计依据
+
+## 1. 三条数据流
+
+```
+浏览器卡片 ──edit/save──▶ configForms(compaction-tuning) ──▶ settings.update
+        ──▶ config-editor 写 profile patch ──▶ Loader Entry.update
+        ──▶ 只有 volatile 字段变化 ⇒ _commitVolatile() 就地改 refs + loader/volatile-update
+        ──▶ CompactionTuning.#config 的 ref 值已变
+
+agent/pre-step ──▶ CompactionPackEngine.compactIfNeeded
+        ──read──▶ ctx.compactionTuning.snapshot()   （每次决策现读，不缓存）
+        ──▶ tokenMeter.measure → 阈值比较 → selectCompactableRange
+        ──▶ this.compactRegion(start,end,agent,signal)   （继承的事务）
+        ──▶ this.summarize() 覆盖：尾部 user 消息 = 可编辑指令
+
+compaction/summary 事件 ──▶ 会话日志完整保存 summary 原文 / shadowedSeqs / rawOutput
+```
+
+## 2. 为什么必须拆成两半
+
+| 事实（B 级，源码） | 推论 |
+|---|---|
+| `presets/standard.patch.yml` 的 compaction 组声明 `isolate: {compaction: true}`；`vendor/cordis/src/context.ts` 的 `isolate()` 文档写明「never fall back」 | profile 根的 `compaction` 提供者在组内不可见 ⇒ 引擎必须写进预设的插件列表 |
+| `packages/settings/settings/src/index.ts` 的 `describe()` 遍历 `configEditor.configuration()`（profile 条目） | 预设内的行没有设置命名空间 ⇒ 可调配置必须放在 profile 根的插件里 |
+| `Entry.update` 逐 key 赋值，`config` 整体替换 | 覆盖 `preset-standard` 必须重述完整 config |
+
+因此：**tuning（根，持配置） + engine（预设，读配置）**，服务名 `compactionTuning` 未被隔离，预设子域可直接注入。
+
+## 3. 引擎的覆盖面与复用面
+
+覆盖：
+
+- `compactIfNeeded(agent, trigger, signal)` —— 压力/溢出两条策略读 `tuning.snapshot()`：
+  `messageBudget = W - O`，`pressureBudget = messageBudget - headroom`，
+  `threshold = floor(min(W*thresholdRatio, pressureBudget))`，
+  `retain = retainTokens ?? floor(messageBudget*retainRatio)`；`retain >= threshold` 直接报错。
+- `summarize(input, agent, signal)` —— 自定义指令 + 路由（配置对 → 最近作答的 assistant 消息记录的路由 → 已提交 header → `agent.options`）。
+
+复用（不重写，避免破坏不变量）：`compactRegion`（范围校验、锁、start/summary/end 事务、图片策略）、`compactNow`、`answeredRoute` 投影、`tokenMeter` 计价、工具配对边界。
+
+## 4. 可调项与默认值
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| enabled | true | 自动压力 + 溢出恢复；`/compact` 不受影响 |
+| thresholdRatio | 0.35 | 1M 窗口、393k 输出预留 ⇒ 阈值 350,000 |
+| headroomTokens | 65536 | 压力余量（`W-O-B` 必须为正） |
+| retainRatio | 0.30 | 1M 窗口 ⇒ 18 万逐字保留 |
+| retainTokens | 空 | 绝对预算，填了覆盖比例；必须 < threshold |
+| maxSummaryTokens | 65536 | 单次检查点输出上限（实测随包只写 3.4k，上限不是约束） |
+| compactionRetries | 1 | 一次触发内追加压缩次数 |
+| maxOverflowRetries | 1 | 溢出恢复重试 |
+| overflowRetainTokens | 0 | 溢出时保留的尾部；0 = 只留最后节点（随包语义） |
+| summarizationProvider/Model | 空 | 空 = 跟随最近作答模型（保留 KV cache 前缀复用） |
+| language | auto | auto / zh / en |
+| prompt | 长指令 | 见 `src/prompt.mjs` |
+
+## 5. 提示词设计要点（对症随包退化）
+
+随包实测：332,692 tokens → 11,231 字符摘要，一次压缩吞 614 个 surface 节点，指令要求「terse + 固定 8 段 + 英文」。本包指令改四点：
+
+1. **语言跟随对话**（`{{language}}` 槽位），不再强制英文。
+2. **证据链段**：要求「结论 + 文件:行 / 命令 / 实测数字 / 错误串」，删掉「怎么搜的」的叙述。
+3. **用户纠正段**：逐字引用，明确「删掉就会被当错误重犯」。
+4. **取代而非删除**：旧结论被推翻写成「旧 -> 被新取代（原因）」，明确禁止因「旧」而删。
+
+## 6. 失败模式
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| `leaves no pressure budget` | `W-O-headroom <= 0` | 降 headroomTokens 或换更大窗口 |
+| `retain ... must stay below threshold` | 保留预算 ≥ 阈值 | 降 retain 或升 thresholdRatio |
+| `no provider/model available for summarization` | 尚无作答记录且未配路由 | 先路由一次或配置摘要路由 |
+| `summarization truncated at the token cap` | 输出撞 maxSummaryTokens | 提高上限 |
+| `summary is not smaller than the shadowed content` | 摘要没缩小 | 该范围不可压缩，换更早范围 |
+| 卡片显示但保存无效 | 引擎缓存了配置 | 引擎必须在每次决策读 `tuning.snapshot()` |
+## 7. 输出预留（outputCap）
+
+`maxTokens` 直接进压缩阈值：`threshold ≤ W − O − B`。1M 窗口下 393,216 → 天花板 541,248；98,304 → 836,160。
+实测 36,795 条输出的 p99 = 9,739、max = 52,749，98,304 有 1.9 倍余量。
+
+钳制入口是 `agent/request` waterfall 返回的 `LlmCallConfig`（`packages/core/agent/src/runtime-types.ts`），
+对全部路由一视同仁；解析顺序 `agentPreset → cwd 最长前缀 → 默认`，四个字段全 volatile，卡片可改。
+
+它改变的是 harness 的预算口径与单轮输出上限，**不是**提供方的窗口校验：实测存在 800k 输入的请求成功，
+说明提供方不按预留拒绝，所以不要指望靠它解决溢出。

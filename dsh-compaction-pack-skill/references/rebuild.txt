@@ -1,0 +1,108 @@
+# 逐条重建 / 移植（已实测跑通）
+
+下面这套在一台 Windows + DSH 源码 checkout 的机器上完整跑过：从 `references/files/` 起，到两个自检全绿，产物与已安装版本哈希一致。
+
+## 0. 前置
+
+- Node ≥ 24（DSH 要求），pnpm 可用。
+- esbuild：`<dsh-checkout>\node_modules\.bin\esbuild.CMD`（DSH 自带；没有就 `pnpm add -D esbuild`）。
+- DSH 安装的包目录：源码 checkout 是 `<checkout>\packages`，装好的客户端是 `<install>\node_modules\@deepseek-ai`。
+- 目标 profile 目录：`$env:USERPROFILE\.dsh\profiles\web`（按实际）。
+
+## 1. 摊开文件
+
+```
+<pack>/
+  package.json            <- references/files/package.json
+  src/engine.mjs          <- references/files/engine.mjs
+  src/tuning.mjs          <- references/files/tuning.mjs
+  src/prompt.mjs          <- references/files/prompt.mjs
+  src/index.mjs           <- references/files/index.mjs
+  lib/client.js           <- references/files/client.js
+  tools/gen-patch.mjs     <- references/files/gen-patch.mjs
+  tools/install.ps1       <- references/files/install.ps1
+  tools/selfcheck.mjs     <- references/files/selfcheck.mjs
+  tools/client-smoke.mjs  <- references/files/client-smoke.mjs
+```
+
+```powershell
+$tmp="$env:TEMP\compaction-pack-rebuild"; $f='<skill>\references\files'
+New-Item -ItemType Directory -Force -Path "$tmp\src","$tmp\lib","$tmp\tools" | Out-Null
+Copy-Item "$f\engine.mjs","$f\tuning.mjs","$f\prompt.mjs","$f\index.mjs" "$tmp\src"
+Copy-Item "$f\client.js" "$tmp\lib"
+Copy-Item "$f\gen-patch.mjs","$f\install.ps1","$f\selfcheck.mjs","$f\client-smoke.mjs" "$tmp\tools"
+Copy-Item "$f\package.json" $tmp
+```
+
+## 2. 打包 Host 半
+
+```powershell
+cd $tmp
+$esbuild = '<dsh-checkout>\node_modules\.bin\esbuild.CMD'
+& $esbuild src/tuning.mjs --bundle --format=esm --platform=node "--external:@deepseek-ai/*" --outfile=lib/tuning.js --log-level=warning
+& $esbuild src/engine.mjs --bundle --format=esm --platform=node "--external:@deepseek-ai/*" --outfile=lib/engine.js --log-level=warning
+& $esbuild src/index.mjs  --bundle --format=esm --platform=node --outfile=lib/index.js --log-level=warning
+```
+
+期望：`tuning.js ≈ 6.9 KB`、`engine.js ≈ 13.9 KB`、`index.js ≈ 58 B`。若 engine 变成 1 MB 左右，说明 `@deepseek-ai/*` 没外置。
+
+## 3. 依赖联接
+
+```powershell
+New-Item -ItemType Directory -Force -Path node_modules | Out-Null
+cmd /c mklink /J "node_modules\@deepseek-ai" "<dsh>\node_modules\@deepseek-ai"
+node -e "import('./lib/engine.js').then(()=>console.log('engine ok'))"
+```
+
+源码 checkout 的 `<dsh>` 通常是 `%USERPROFILE%\.dsh\profiles`（DSH 包在 profiles 根，不在 profile 目录里）。`tools/install.ps1` 会自动按候选顺序探测并跑两个自检。
+
+## 4. 生成覆盖层
+
+```powershell
+node tools/gen-patch.mjs "<dsh-web-app>/presets/standard.patch.yml"
+```
+
+期望输出：`gen-patch: wrote <pack>\cordis.patch.yml from ...`。自检判据：
+
+- 文件里出现 `- id: preset-standard`（不是新增 preset，是覆盖）；
+- compaction 组的三行是 `compaction-engine` / `command-compact` / `tool-result-pruner`；
+- 尾部有 `compaction-tuning` 与 `compaction-pack-ui` 两条根行；
+- `!!js` 表达式原样保留（脚本只改那两行文本）。
+
+**DSH 升级后必须重跑**：`plugins` 列表是版本相关数据。
+
+## 5. 安装
+
+插件页 →「添加插件」→ 选 `<pack>` 目录（本地目录安装）。或命令行 `dsh plugin add <pack>`。期望返回 `application: applied`。
+
+装完检查 `~/.dsh/profiles/<p>/package.json` 的 `dsh.profile.bundles` 末尾出现 `@dsh-external/dsh-compaction-pack`。
+
+## 6. 验证（四级 + 两自检）
+
+```powershell
+node tools/selfcheck.mjs      # Host 半 + 补丁
+node tools/client-smoke.mjs   # 客户端半装配
+dsh --profile <p> --dump-config | Select-String -Pattern 'compaction-pack|compaction-engine' -Context 1,1
+```
+
+- **组合**：dump 里 `# == @dsh-external/dsh-compaction-pack` 段内 `preset-standard` 的 compaction 组是 `compaction-engine`。
+- **挂载**：**新开一个会话**（或跑一次 subagent），能正常开始即说明预设挂载成功。
+- **设置**：`cordis_inspect_query`（host / Config / `listConfigs`，name=`@dsh-external/dsh-compaction-pack/tuning`）→ 状态 `schema`；再查 entry `include:compaction-tuning` 应看到 13 个字段带 `x-cordis.volatile`。
+- **客户端**：`cordis_inspect_query`（client / Slots / `listSubTree`，root=`plugins.item`）→ occupants 里 `compaction-pack` 且 `active: true`。
+
+真跑一次压缩后，在会话日志里查 `compaction/summary`：`provider/model` 是否等于设置的摘要路由，`shadowedTokenCount` 是否落在阈值附近。
+
+## 7. 改字段 / 改提示词的落点
+
+- 加字段：`src/tuning.mjs` 的 `DEFAULTS` + `Config`（每个都要 `.volatile()`，volatile 不能嵌在数组/dict 里），同步 `lib/client.js` 的 `FIELDS` 数组与两份词典；然后重打包。
+- 改提示词：不用重打包——卡片里的「检查点指令」文本域就是 `prompt` 字段，清空回退到 `MINIMAL_PROMPT`；要改默认值则改 `src/prompt.mjs` 的 `DEFAULT_PROMPT` 并重打包（已安装的 profile 里旧默认值仍在 `providers` 的 patch 中，必要时在卡片里点重置）。
+
+## 8. 失败处置
+
+| 症状 | 原因 | 处置 |
+|---|---|---|
+| `gen-patch: ... has no compaction-basic row` | 该 DSH 版本的预设改了形态 | 打开随包 `standard.patch.yml` 看 compaction 组的新行名，手工改脚本的匹配串 |
+| `install.ps1` 报 has no cordis | 联接目标指到了 profile 自己的 node_modules | 用 `-DshModules <profiles 根>\node_modules\@deepseek-ai` |
+| 卡片不出现 | bundle 未启用 / 客户端半没被服务 | 插件页确认 bundle enabled；`Slots.listSubTree` 看 occupant；刷新页面（客户端模块按页面加载） |
+| 保存后值不变 | 行不是 volatile 或引擎缓存了快照 | 查 `x-cordis.volatile`；确认引擎每次读 `tuning.snapshot()` |
+| 新会话仍走旧引擎 | 用了旧预设版本 | 新会话才是新 revision；或确认 dump 里覆盖层生效 |
